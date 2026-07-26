@@ -33,8 +33,8 @@ from fastapi.responses import Response, StreamingResponse
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-TARGET   = "https://agentrouter.org"
-PORT     = 7187
+TARGET = "https://agentrouter.org"
+PORT = 7187
 KEY_FILE = Path.home() / ".config/opencode/api_keys/AGENT_ROUTER_API_KEY"
 
 # Seconds between received SSE chunks before aborting a streaming request.
@@ -82,13 +82,66 @@ def _client() -> anthropic.Anthropic:
 
 # ── Request translation ───────────────────────────────────────────────────────
 
-_SKIP  = {"stream"}                     # handled separately
-_STRIP = {"thinking", "output_config"}  # non-standard; trigger agentrouter content filter
+_SKIP = {"stream"}  # handled separately in the route (streaming vs non-streaming)
 
 
 def _kwargs(body: dict) -> dict:
-    """Forward all fields except stream (handled separately) and non-standard extras."""
-    return {k: v for k, v in body.items() if k not in _SKIP and k not in _STRIP}
+    """Forward all fields except stream.
+
+    Thinking is supported: when the client doesn't specify a thinking /
+    effort configuration, default to adaptive thinking at high effort
+    (high is also the Anthropic default effort). Client-supplied thinking
+    and output_config always win, so an explicit client choice (e.g.
+    effort: "xhigh") is respected rather than overridden.
+
+    Verified against agentrouter.org for claude-opus-4-8, gpt-5.6-sol, and
+    glm-5.2 — all accept these fields. The earlier note about them
+    triggering the content filter was inaccurate: 405 WAF blocks are
+    triggered by request-body code content (PHP/shell tokens), not by
+    thinking fields.
+
+    max_tokens defaults to 64000 when the client omits it — generous
+    headroom for adaptive thinking plus output. Verified safe for both
+    streaming and non-streaming against agentrouter.org.
+
+    For OpenAI-compatible models (non-claude-*), reasoning depth is also
+    signalled via the OpenAI-style `reasoning_effort` field. The Anthropic
+    SDK rejects `reasoning_effort` as a direct kwarg (TypeError), so it is
+    popped from the body and routed through `extra_body`. A value is always
+    present on outgoing requests (default "high", mirroring effort);
+    AgentRouter accepts it for gpt-*/glm-* and ignores it for Claude, so
+    it is harmless to send unconditionally across all model families.
+    """
+    kw = {k: v for k, v in body.items() if k not in _SKIP}
+
+    # reasoning_effort is an OpenAI-format param the SDK rejects as a direct
+    # kwarg — pop it here so it never reaches messages.create(**kw) directly;
+    # it is re-attached via extra_body below for every model.
+    re_effort = kw.pop("reasoning_effort", None)
+
+    if "thinking" not in kw:
+        kw["thinking"] = {"type": "adaptive"}
+    if "output_config" not in kw:
+        kw["output_config"] = {"effort": "high"}
+    if "max_tokens" not in kw:
+        kw["max_tokens"] = 64000
+
+    # Always send reasoning_effort for every model: default it to high when
+    # the client didn't specify one (mirroring output_config.effort). Sent via
+    # extra_body on every request — Claude models ignore it upstream, so
+    # there's no downside to sending it unconditionally, and it keeps all
+    # model families on the same path. Client-supplied values are passed
+    # through verbatim (no clamping — xhigh/max go through as-is).
+    if re_effort is None:
+        oc = kw.get("output_config")
+        if isinstance(oc, dict) and "effort" in oc:
+            re_effort = oc["effort"]
+        else:
+            re_effort = "high"
+
+    kw["extra_body"] = {"reasoning_effort": re_effort}
+
+    return kw
 
 
 # ── Streaming helper ──────────────────────────────────────────────────────────
@@ -103,8 +156,13 @@ def _stream_worker(kw: dict, q: queue.Queue) -> None:
 
     try:
         with _client().messages.with_streaming_response.create(**kw) as resp:
-            buf        = b""
+            buf = b""
             skip_block = False
+            # Track terminal events so we can synthesize any the upstream
+            # translator omitted (see the note after the loop).
+            block_open = False
+            seen_message_delta = False
+            seen_message_stop = False
 
             for raw_chunk in resp.iter_bytes(chunk_size=1024):
                 buf += raw_chunk
@@ -113,8 +171,8 @@ def _stream_worker(kw: dict, q: queue.Queue) -> None:
                     nl = buf.find(b"\n")
                     if nl == -1:
                         break
-                    line     = buf[: nl + 1]   # include \n
-                    buf      = buf[nl + 1:]
+                    line = buf[: nl + 1]  # include \n
+                    buf = buf[nl + 1:]
                     stripped = line.rstrip(b"\r\n")
 
                     if stripped.startswith(b"event:"):
@@ -122,6 +180,14 @@ def _stream_worker(kw: dict, q: queue.Queue) -> None:
                         skip_block = event_name in SKIP_EVENTS
                         if skip_block:
                             continue
+                        if event_name == b"content_block_start":
+                            block_open = True
+                        elif event_name == b"content_block_stop":
+                            block_open = False
+                        elif event_name == b"message_delta":
+                            seen_message_delta = True
+                        elif event_name == b"message_stop":
+                            seen_message_stop = True
                     elif skip_block:
                         if stripped == b"":
                             skip_block = False  # blank line ends the event block
@@ -131,6 +197,24 @@ def _stream_worker(kw: dict, q: queue.Queue) -> None:
 
             if buf:
                 q.put(buf)
+
+            # AgentRouter's OpenAI→Anthropic SSE translator (used for non-Claude
+            # models like gpt-5.6-sol / glm-5.2) ends the stream after the last
+            # content_block_delta WITHOUT emitting content_block_stop /
+            # message_delta / message_stop. With no message_delta there is no
+            # stop_reason, so AI-SDK clients (@ai-sdk/anthropic) default the
+            # finish_reason to "other" and hard-fail (Cherry Studio's
+            # AI_FinishReasonError). The SDK iterator finished without raising,
+            # so the connection closed cleanly and the model stopped normally —
+            # synthesize the missing terminal events with stop_reason=end_turn,
+            # matching what the non-streaming path returns for these models.
+            if not seen_message_stop:
+                if block_open:
+                    q.put(b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n')
+                if not seen_message_delta:
+                    q.put(
+                        b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}\n\n')
+                q.put(b'event: message_stop\ndata: {"type":"message_stop"}\n\n')
 
     except Exception as exc:
         q.put(exc)
@@ -169,7 +253,7 @@ app = FastAPI()
 @app.post("/messages")
 async def messages(request: Request):
     body = await request.json()
-    kw   = _kwargs(body)
+    kw = _kwargs(body)
 
     if body.get("stream", False):
         kw["stream"] = True
@@ -220,6 +304,12 @@ async def models():
         "object": "list",
         "data": [
             {"id": "claude-opus-4-6", "object": "model"},
+            {"id": "claude-opus-4-7", "object": "model"},
+            {"id": "claude-opus-4-8", "object": "model"},
+            {"id": "gpt-5.5", "object": "model"},
+            {"id": "gpt-5.6-sol", "object": "model"},
+            {"id": "glm-5.2", "object": "model"},
+            {"id": "kimi-k3", "object": "model"},
         ],
     }
 

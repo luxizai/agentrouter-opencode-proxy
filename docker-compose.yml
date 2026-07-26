@@ -1,0 +1,32 @@
+# docker compose up -d  →  AgentRouter proxy on http://localhost:7187
+#
+# Reads your AgentRouter API key from the environment (AGENTROUTER_API_KEY).
+# Set it before running:
+#
+#   export AGENTROUTER_API_KEY=sk-...        # Linux/macOS
+#   $env:AGENTROUTER_API_KEY = 'sk-...'      # PowerShell
+#
+# Or put it in an .env file next to this compose file:
+#   echo "AGENTROUTER_API_KEY=sk-..." > .env
+#
+# Then:
+#   docker compose up -d --build
+#   docker compose logs -f
+#   curl http://localhost:7187/v1/models
+#   docker compose down
+
+services:
+  agentrouter-proxy:
+    build: .
+    image: agentrouter-proxy:latest
+    restart: unless-stopped
+    ports:
+      - "7187:7187"
+    environment:
+      AGENTROUTER_API_KEY: ${AGENTROUTER_API_KEY:-}
+    healthcheck:
+      test: [ "CMD", "curl", "-fsS", "http://127.0.0.1:7187/v1/models" ]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
