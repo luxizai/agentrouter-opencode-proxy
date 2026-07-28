@@ -310,6 +310,8 @@ async def models():
             {"id": "gpt-5.6-sol", "object": "model"},
             {"id": "glm-5.2", "object": "model"},
             {"id": "kimi-k3", "object": "model"},
+            {"id": "claude-fable-5", "object": "model"},
+            {"id": "claude-opus-5", "object": "model"},
         ],
     }
 

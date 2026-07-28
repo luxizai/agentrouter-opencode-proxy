@@ -20,6 +20,8 @@ services:
     build: .
     image: agentrouter-proxy:latest
     restart: unless-stopped
+    volumes:
+      - .:/app
     ports:
       - "7187:7187"
     environment:
