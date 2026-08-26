@@ -312,6 +312,8 @@ async def models():
             {"id": "kimi-k3", "object": "model"},
             {"id": "claude-fable-5", "object": "model"},
             {"id": "claude-opus-5", "object": "model"},
+            {"id": "deepseek-v4-flash", "object": "model"},
+            {"id": "glm-5.3", "object": "model"},
         ],
     }
 
