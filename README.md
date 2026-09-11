@@ -157,6 +157,7 @@ This is the exact architecture of `proxy.py` in this repo.
 | 6 | AgentRouter injects `billing_summary` SSE events that break OpenCode's parser | Discovered live during setup |
 | 7 | `thinking` and `output_config` fields trigger AgentRouter's content filter | Discovered live during setup |
 | 8 | OpenCode AI SDK calls `/messages` not `/v1/messages` | Discovered live during setup |
+| 9 | Aliyun WAF returns 405 HTML block when request body contains PHP tags (`<?php`) or shell tokens | Discovered live during setup |
 
 ---
 
@@ -166,7 +167,7 @@ This is the exact architecture of `proxy.py` in this repo.
 |---|---|
 | WAF also blocks `httpx.AsyncClient` and raw `httpx.Client` | Must use `anthropic.Anthropic` (sync), not `AsyncAnthropic` or bare httpx |
 | AgentRouter injects `billing_summary` SSE events | Proxy filters them — OpenCode's Zod parser rejects unknown event types |
-| OpenCode sends `thinking: {type: adaptive}` and `output_config` fields | Proxy strips these — AgentRouter's content filter blocks requests containing them |
+| Aliyun WAF 405 blocks on code tokens (`<?php`, `system(`, etc.) | Proxy transparently neutralizes these using invisible zero-width spaces (`\u200b`) |
 | OpenCode AI SDK calls `/messages` (no `/v1` prefix) | Proxy mounts on both `/messages` and `/v1/messages` |
 | `GET /v1/models` is also WAF-blocked | Proxy returns a local stub model list instead |
 
@@ -314,6 +315,7 @@ A successful response means the WAF check passed and the model has capacity.
 |---|---|---|
 | `unauthorized client detected` | WAF blocked — not using proxy | Ensure your client points to `http://localhost:7187`, not agentrouter.org directly |
 | `503 no available channel` | Model pool exhausted on agentrouter.org | Try another model or wait and retry |
-| `content-blocked` | Non-standard request fields | Proxy strips `thinking` and `output_config` already; if it persists, report an issue |
+| `405 / AI_APICallError` ("很抱歉，由于您访问的URL有可能对网站造成安全威胁...") | Aliyun WAF blocked request body containing code tokens (`<?php`, shell functions) | The proxy automatically neutralizes these using invisible zero-width spaces (`\u200b`); make sure proxy is updated |
+| `content-blocked` | AgentRouter upstream content filter triggered | Avoid triggering sensitive keywords or try another model family |
 | `Not Found` from proxy | Wrong path | Proxy handles `/messages` and `/v1/messages` — ensure `baseURL` has no path suffix |
 | Port 7187 already in use | Old proxy still running | `lsof -ti :7187 \| xargs kill -9` |
