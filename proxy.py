@@ -95,16 +95,27 @@ def _client() -> anthropic.Anthropic:
     return _client_for(_api_key())
 
 
-def _extract_api_key(request: Request) -> str:
-    """Extract API key from request headers (x-api-key or Authorization: Bearer), falling back to server default."""
-    k = request.headers.get("x-api-key", "").strip()
-    if k:
-        return k
-    auth = request.headers.get("authorization", "").strip()
-    if auth.lower().startswith("bearer "):
-        k = auth[7:].strip()
+def _extract_api_key(request: Request | None = None) -> str:
+    """Resolve API key: prioritize server configuration (.env / env var / KEY_FILE).
+    If no server key is configured, fallback to client request headers (x-api-key or Authorization: Bearer).
+    """
+    try:
+        server_key = _api_key()
+        if server_key:
+            return server_key
+    except Exception:
+        pass
+
+    if request:
+        k = request.headers.get("x-api-key", "").strip()
         if k:
             return k
+        auth = request.headers.get("authorization", "").strip()
+        if auth.lower().startswith("bearer "):
+            k = auth[7:].strip()
+            if k:
+                return k
+
     return _api_key()
 
 

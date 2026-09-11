@@ -28,7 +28,7 @@ services:
       AGENTROUTER_API_KEY: ${AGENTROUTER_API_KEY:-}
     healthcheck:
       test: [ "CMD", "curl", "-fsS", "http://127.0.0.1:7187/v1/models" ]
-      interval: 30s
+      interval: 3600s
       timeout: 5s
       start_period: 10s
       retries: 3
