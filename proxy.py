@@ -314,6 +314,7 @@ async def models():
             {"id": "claude-opus-5", "object": "model"},
             {"id": "deepseek-v4-flash", "object": "model"},
             {"id": "glm-5.3", "object": "model"},
+            {"id": "gpt-6-astra", "object": "model"},
         ],
     }
 
