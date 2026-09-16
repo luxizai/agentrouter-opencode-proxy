@@ -126,8 +126,8 @@ _ZWSP = "\u200b"
 
 # Pre-compiled WAF neutralization patterns across multiple languages & vectors
 _WAF_RULES = [
-    # 1. PHP opening tags & script language php
-    (re.compile(r"(<\?)\s*(php)", re.IGNORECASE), rf"\g<1>{_ZWSP}\g<2>"),
+    # 1. PHP opening tags & script language php (including <?php, <?=, <? and <script language=php>)
+    (re.compile(r"(<)(\?)(php|=|[\s\n\r])", re.IGNORECASE), rf"\g<1>{_ZWSP}\g<2>\g<3>"),
     (re.compile(r"(<script[^>]*language\s*=\s*[\'\"]?)(php)", re.IGNORECASE), rf"\g<1>{_ZWSP}\g<2>"),
 
     # 2. JSP / ASP tags & response methods
@@ -135,32 +135,40 @@ _WAF_RULES = [
     (re.compile(r"\b(out)\s*\.\s*(println)\b", re.IGNORECASE), rf"\g<1>.{_ZWSP}\g<2>"),
     (re.compile(r"\b(Response)\s*\.\s*(Write)\b", re.IGNORECASE), rf"\g<1>.{_ZWSP}\g<2>"),
 
-    # 3. Execution functions: system(, exec(, eval(, passthru(, assert(, phpinfo(, sleep(
-    (re.compile(r"\b(system|exec|eval|passthru|assert|phpinfo|sleep)\s*\(", re.IGNORECASE), rf"\g<1>{_ZWSP}("),
+    # 3. Execution functions & SQLi/dangerous functions:
+    # system(, exec(, eval(, passthru(, assert(, phpinfo(, sleep(, load_file(, updatexml(, extractvalue(, benchmark(, shell_exec(, popen(, proc_open(
+    (re.compile(r"\b(system|exec|eval|passthru|assert|phpinfo|sleep|load_file|updatexml|extractvalue|benchmark|shell_exec|popen|proc_open)\s*\(", re.IGNORECASE), rf"\g<1>{_ZWSP}("),
 
-    # 4. Dangerous protocols: ldap://, rmi://, file:///
+    # 4. Dangerous protocols & JNDI: ldap://, rmi://, file:///, ${jndi:...}
     (re.compile(r"\b(ldap|rmi):(//)", re.IGNORECASE), rf"\g<1>:{_ZWSP}\g<2>"),
     (re.compile(r"\b(file):(//+)", re.IGNORECASE), rf"\g<1>:{_ZWSP}\g<2>"),
+    (re.compile(r"(\$\{)\s*(jndi)", re.IGNORECASE), rf"\g<1>{_ZWSP}\g<2>"),
+    (re.compile(r"\b(jndi)\s*:", re.IGNORECASE), rf"\g<1>{_ZWSP}:"),
 
-    # 5. Node.js child_process
+    # 5. Node.js child_process & Java Runtime
     (re.compile(r"\b(child)_(process)\b", re.IGNORECASE), rf"\g<1>_{_ZWSP}\g<2>"),
+    (re.compile(r"\b(getRuntime|ProcessBuilder)\s*\(", re.IGNORECASE), rf"\g<1>{_ZWSP}("),
 
-    # 6. Sensitive files & directory traversal
-    (re.compile(r"(/etc/)(passwd|shadow)\b", re.IGNORECASE), rf"\g<1>{_ZWSP}\g<2>"),
+    # 6. Sensitive files & directory traversal (/etc/passwd, /etc/hosts, win.ini, Windows/System32)
+    (re.compile(r"(/etc/)(passwd|shadow|hosts|group|issue)\b", re.IGNORECASE), rf"\g<1>{_ZWSP}\g<2>"),
+    (re.compile(r"(\\etc\\)(passwd|shadow|hosts|group|issue)\b", re.IGNORECASE), rf"\g<1>{_ZWSP}\g<2>"),
+    (re.compile(r"\b(win)(dows)[/\\](system32)\b", re.IGNORECASE), rf"\g<1>{_ZWSP}\g<2>/\g<3>"),
     (re.compile(r"\b(win)\.(ini)\b", re.IGNORECASE), rf"\g<1>.{_ZWSP}\g<2>"),
     (re.compile(r"(\.\.)([/\\])"), rf"\g<1>{_ZWSP}\g<2>"),
 
-    # 7. SQL injection triggers (WAITFOR DELAY, ' OR '1'='1, ' OR 1=1)
+    # 7. SQL injection triggers (WAITFOR DELAY, ' OR '1'='1, ' OR 1=1, @@variables, concat(0x...))
     (re.compile(r"\b(WAITFOR)\s+(DELAY)\b", re.IGNORECASE), rf"\g<1>{_ZWSP} \g<2>"),
     (re.compile(r"('|\")\s*(O)(R)\b", re.IGNORECASE), rf"\g<1> \g<2>{_ZWSP}\g<3>"),
+    (re.compile(r"(@)(@\w+)", re.IGNORECASE), rf"\g<1>{_ZWSP}\g<2>"),
+    (re.compile(r"\b(concat)\s*\(\s*(0)(x[0-9a-fA-F]+)", re.IGNORECASE), rf"\g<1>(\g<2>{_ZWSP}\g<3>"),
 
     # 8. HTML / XSS / XXE
     (re.compile(r"(<scr)(ipt)", re.IGNORECASE), rf"\g<1>{_ZWSP}\g<2>"),
     (re.compile(r"\b(on)(error|load)\s*=", re.IGNORECASE), rf"\g<1>{_ZWSP}\g<2>="),
     (re.compile(r"(<!EN)(TITY)\b", re.IGNORECASE), rf"\g<1>{_ZWSP}\g<2>"),
 
-    # 9. Shell command injection chaining (; echo, | echo)
-    (re.compile(r"([;|])\s*(echo)\b", re.IGNORECASE), rf"\g<1>{_ZWSP}\g<2>"),
+    # 9. Shell command injection chaining (; echo, ; cat, | bash, && rm, etc.)
+    (re.compile(r"([;|&`]\s*)\b(echo|cat|curl|wget|bash|sh|zsh|python|perl|ruby|rm|ls|id|whoami|chmod|chown|kill|nc|netcat|uname)\b", re.IGNORECASE), rf"\g<1>{_ZWSP}\g<2>"),
 ]
 
 
