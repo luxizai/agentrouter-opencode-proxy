@@ -19,6 +19,7 @@ Usage:
     AGENTROUTER_API_KEY=sk-... python proxy.py
 """
 import asyncio
+import copy
 import json
 import os
 import queue
@@ -158,7 +159,7 @@ _WAF_RULES = [
 
     # 7. SQL injection triggers (WAITFOR DELAY, ' OR '1'='1, ' OR 1=1, @@variables, concat(0x...))
     (re.compile(r"\b(WAITFOR)\s+(DELAY)\b", re.IGNORECASE), rf"\g<1>{_ZWSP} \g<2>"),
-    (re.compile(r"('|\")\s*(O)(R)\b", re.IGNORECASE), rf"\g<1> \g<2>{_ZWSP}\g<3>"),
+    (re.compile(r"('|\")\s*(O)(R)\b", re.IGNORECASE), rf"\g<1>\g<2>{_ZWSP}\g<3>"),
     (re.compile(r"(@)(@\w+)", re.IGNORECASE), rf"\g<1>{_ZWSP}\g<2>"),
     (re.compile(r"\b(concat)\s*\(\s*(0)(x[0-9a-fA-F]+)", re.IGNORECASE), rf"\g<1>(\g<2>{_ZWSP}\g<3>"),
 
@@ -223,11 +224,7 @@ def _sanitize_for_waf(data: Any, parent_key: str = "") -> Any:
     return data
 
 
-def _to_fullwidth_letters(s: str) -> str:
-    """Convert Latin letters [a-zA-Z] to Unicode fullwidth [ａ-ｚＡ-Ｚ].
-    This breaks WAF/moderation token extraction (which extracts ASCII a-z) while
-    preserving digits, symbols, spaces, indentation, and semantic readability for LLMs.
-    """
+def _convert_chars_to_fullwidth(s: str) -> str:
     res = []
     for char in s:
         code = ord(char)
@@ -236,6 +233,21 @@ def _to_fullwidth_letters(s: str) -> str:
         else:
             res.append(char)
     return "".join(res)
+
+
+def _to_fullwidth_letters(s: str) -> str:
+    """Convert Latin letters [a-zA-Z] to Unicode fullwidth [ａ-ｚＡ-Ｚ] to evade WAF token extraction,
+    while strictly preserving URLs (http:// and https://) in original ASCII.
+    """
+    url_pattern = re.compile(r'https?://[^\s"\'<>]+', re.IGNORECASE)
+    parts = []
+    last_end = 0
+    for m in url_pattern.finditer(s):
+        parts.append(_convert_chars_to_fullwidth(s[last_end:m.start()]))
+        parts.append(m.group(0))  # Preserve URL intact as ASCII
+        last_end = m.end()
+    parts.append(_convert_chars_to_fullwidth(s[last_end:]))
+    return "".join(parts)
 
 
 def _fullwidth_neutralize(data: Any, parent_key: str = "") -> Any:
@@ -263,6 +275,65 @@ def _fallback_kw(kw: dict) -> dict:
     return ret
 
 
+def _clean_model_output(s: str) -> str:
+    """Normalize model output before returning to client.
+    1. Remove zero-width spaces (\u200b).
+    2. Convert fullwidth Latin letters [ａ-ｚＡ-Ｚ] back to standard ASCII [a-zA-Z].
+    3. Normalize fullwidth URL punctuation (． -> ., ／ -> /, ：// -> ://).
+    4. Fix broken/spaced URL schemes like 'h t t p : / /' or 'h t t p s : / /'.
+    """
+    if not isinstance(s, str) or not s:
+        return s
+
+    # 1. Remove zero-width space (both literal and JSON-escaped)
+    s = s.replace("\u200b", "").replace("\\u200b", "").replace("\\u200B", "")
+
+    # 2. Convert fullwidth Latin letters [ａ-ｚＡ-Ｚ] and fullwidth dot/slash to standard ASCII
+    res = []
+    for c in s:
+        code = ord(c)
+        if (0xFF21 <= code <= 0xFF3A) or (0xFF41 <= code <= 0xFF5A):
+            res.append(chr(code - 0xFEE0))
+        elif code == 0xFF0E:  # Fullwidth dot '．'
+            res.append(".")
+        elif code == 0xFF0F:  # Fullwidth slash '／'
+            res.append("/")
+        elif code == 0x3000:  # Fullwidth space
+            res.append(" ")
+        else:
+            res.append(c)
+    s = "".join(res)
+
+    # 3. Normalize fullwidth URL schemes (e.g. http：// -> http://)
+    s = s.replace("：//", "://").replace("：／／", "://")
+
+    # 4. Fix spaced URL protocols like 'h t t p : / /' -> 'http://'
+    s = re.sub(
+        r'(?<![a-zA-Z])h\s*t\s*t\s*p\s*(s?)\s*:\s*/\s*/\s*',
+        lambda m: ('https://' if m.group(1).lower() == 's' else 'http://'),
+        s,
+        flags=re.IGNORECASE
+    )
+
+    return s
+
+
+def _clean_sse_line(line: bytes) -> bytes:
+    """Clean streaming SSE lines before sending to client."""
+    if not line:
+        return line
+    # Fast byte-level strip of zero-width space
+    line = line.replace(b"\xe2\x80\x8b", b"")
+    if line.startswith(b"data:"):
+        try:
+            text = line.decode("utf-8")
+            cleaned = _clean_model_output(text)
+            return cleaned.encode("utf-8")
+        except Exception:
+            return line
+    return line
+
+
 def _is_blocked_error(exc: Exception) -> bool:
     """Check if an exception is caused by upstream WAF or content-blocked moderation."""
     if isinstance(exc, anthropic.APIStatusError):
@@ -275,6 +346,87 @@ def _is_blocked_error(exc: Exception) -> bool:
         if any(w in body_str or w in exc_str for w in ("很抱歉", "security", "<!doctypehtml>", "potential threat")):
             return True
     return False
+
+
+def _is_thinking_error(exc: Exception) -> bool:
+    """Check if an exception is caused by missing thinking block passback in thinking mode."""
+    if isinstance(exc, anthropic.APIStatusError):
+        body_str = str(exc.body) if exc.body else ""
+        exc_str = str(exc)
+        combined = (body_str + " " + exc_str).lower()
+        if "thinking" in combined and (
+            "must be passed back" in combined
+            or "content[].thinking" in combined
+            or "missing field `thinking`" in combined
+            or "missing field 'thinking'" in combined
+        ):
+            return True
+    return False
+
+
+def _fix_thinking_messages(messages: list) -> list:
+    """Ensure all assistant messages satisfy upstream thinking mode requirements.
+
+    In thinking mode (e.g. DeepSeek / Volcengine Ark / AgentRouter), upstream validates
+    that any assistant message in conversation history (especially those containing tool_use)
+    must pass back a valid content[].thinking block.
+    Many clients (OpenCode, Cursor, AI SDK, Cline) strip thinking blocks from history.
+
+    1. If an assistant message contains tool_use (or is a list of blocks) but lacks a thinking block,
+       inject a minimal thinking block {"type": "thinking", "thinking": "..."} at index 0.
+    2. If a thinking block exists but lacks 'thinking' text or has empty thinking,
+       populate it with a placeholder.
+    """
+    fixed = []
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            fixed.append(msg)
+            continue
+
+        msg = copy.deepcopy(msg)
+        content = msg.get("content")
+
+        if isinstance(content, list):
+            has_thinking = False
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "thinking":
+                    has_thinking = True
+                    if not block.get("thinking"):
+                        block["thinking"] = "..."
+            if not has_thinking:
+                has_tool_use = any(isinstance(b, dict) and b.get("type") == "tool_use" for b in content)
+                if has_tool_use:
+                    content.insert(0, {"type": "thinking", "thinking": "..."})
+            msg["content"] = content
+        fixed.append(msg)
+    return fixed
+
+
+def _fallback_thinking_kw(kw: dict) -> dict:
+    """Fallback when upstream rejects due to thinking block validation:
+    1. If any assistant message still lacks a thinking block (e.g. string content or text-only blocks),
+       inject thinking block into all assistant messages.
+    2. If all already have thinking blocks, fallback to disabling thinking mode.
+    """
+    ret = copy.deepcopy(kw)
+    messages = ret.get("messages", [])
+    already_patched = True
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") == "assistant":
+            content = msg.get("content")
+            if isinstance(content, list):
+                if not any(isinstance(b, dict) and b.get("type") == "thinking" and b.get("thinking") for b in content):
+                    already_patched = False
+                    content.insert(0, {"type": "thinking", "thinking": "..."})
+            elif isinstance(content, str):
+                already_patched = False
+                msg["content"] = [
+                    {"type": "thinking", "thinking": "..."},
+                    {"type": "text", "text": content},
+                ]
+    if already_patched:
+        ret["thinking"] = {"type": "disabled"}
+    return ret
 
 
 def _kwargs(body: dict) -> dict:
@@ -305,6 +457,10 @@ def _kwargs(body: dict) -> dict:
     it is harmless to send unconditionally across all model families.
     """
     kw = {k: v for k, v in body.items() if k not in _SKIP}
+
+    # Normalize thinking blocks in assistant messages to satisfy upstream requirements
+    if "messages" in kw and isinstance(kw["messages"], list):
+        kw["messages"] = _fix_thinking_messages(kw["messages"])
 
     # Sanitize messages and system prompt to neutralize Aliyun WAF 405 triggers
     # (e.g. <?php, system(, eval(, /etc/passwd) using invisible zero-width spaces (\u200b).
@@ -366,7 +522,25 @@ def _stream_worker(kw: dict, q: queue.Queue, client: anthropic.Anthropic) -> Non
                 except Exception:
                     pass
                 resp_cm = None
-            if _is_blocked_error(first_err):
+            if _is_thinking_error(first_err):
+                tb_kw = _fallback_thinking_kw(kw)
+                try:
+                    resp_cm = client.messages.with_streaming_response.create(**tb_kw)
+                    resp = resp_cm.__enter__()
+                except Exception as second_err:
+                    if resp_cm is not None:
+                        try:
+                            resp_cm.__exit__(None, None, None)
+                        except Exception:
+                            pass
+                        resp_cm = None
+                    if _is_blocked_error(second_err):
+                        fb_kw = _fallback_kw(tb_kw)
+                        resp_cm = client.messages.with_streaming_response.create(**fb_kw)
+                        resp = resp_cm.__enter__()
+                    else:
+                        raise second_err
+            elif _is_blocked_error(first_err):
                 fb_kw = _fallback_kw(kw)
                 resp_cm = client.messages.with_streaming_response.create(**fb_kw)
                 resp = resp_cm.__enter__()
@@ -411,10 +585,10 @@ def _stream_worker(kw: dict, q: queue.Queue, client: anthropic.Anthropic) -> Non
                             skip_block = False  # blank line ends the event block
                         continue
 
-                    q.put(line)
+                    q.put(_clean_sse_line(line))
 
             if buf:
-                q.put(buf)
+                q.put(_clean_sse_line(buf))
 
             # AgentRouter's OpenAI→Anthropic SSE translator (used for non-Claude
             # models like gpt-5.6-sol / glm-5.2) ends the stream after the last
@@ -534,6 +708,15 @@ async def messages(request: Request):
         try:
             return client.messages.create(**kw)
         except Exception as first_err:
+            if _is_thinking_error(first_err):
+                tb_kw = _fallback_thinking_kw(kw)
+                try:
+                    return client.messages.create(**tb_kw)
+                except Exception as second_err:
+                    if _is_blocked_error(second_err):
+                        fb_kw = _fallback_kw(tb_kw)
+                        return client.messages.create(**fb_kw)
+                    raise second_err
             if _is_blocked_error(first_err):
                 fb_kw = _fallback_kw(kw)
                 return client.messages.create(**fb_kw)
@@ -541,7 +724,8 @@ async def messages(request: Request):
 
     try:
         msg = await asyncio.to_thread(_run)
-        return Response(content=msg.model_dump_json(), media_type="application/json")
+        cleaned_json = _clean_model_output(msg.model_dump_json())
+        return Response(content=cleaned_json, media_type="application/json")
     except Exception as e:
         status, err_body = _format_api_error(e)
         return Response(
