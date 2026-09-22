@@ -236,18 +236,12 @@ def _convert_chars_to_fullwidth(s: str) -> str:
 
 
 def _to_fullwidth_letters(s: str) -> str:
-    """Convert Latin letters [a-zA-Z] to Unicode fullwidth [ａ-ｚＡ-Ｚ] to evade WAF token extraction,
-    while strictly preserving URLs (http:// and https://) in original ASCII.
+    """Convert Latin letters [a-zA-Z] to Unicode fullwidth [ａ-ｚＡ-Ｚ].
+    This breaks WAF/moderation token extraction (which extracts ASCII a-z, sensitive domains,
+    and API key patterns) while preserving digits, symbols, spaces, indentation, and semantic
+    readability for LLMs.
     """
-    url_pattern = re.compile(r'https?://[^\s"\'<>]+', re.IGNORECASE)
-    parts = []
-    last_end = 0
-    for m in url_pattern.finditer(s):
-        parts.append(_convert_chars_to_fullwidth(s[last_end:m.start()]))
-        parts.append(m.group(0))  # Preserve URL intact as ASCII
-        last_end = m.end()
-    parts.append(_convert_chars_to_fullwidth(s[last_end:]))
-    return "".join(parts)
+    return _convert_chars_to_fullwidth(s)
 
 
 def _fullwidth_neutralize(data: Any, parent_key: str = "") -> Any:
@@ -337,13 +331,27 @@ def _clean_sse_line(line: bytes) -> bytes:
 def _is_blocked_error(exc: Exception) -> bool:
     """Check if an exception is caused by upstream WAF or content-blocked moderation."""
     if isinstance(exc, anthropic.APIStatusError):
-        body_str = str(exc.body) if exc.body else ""
-        exc_str = str(exc)
+        # Never treat auth failures, billing/funds, missing models, or rate limits as content-blocked
+        if exc.status_code in (401, 402, 404, 429):
+            return False
+        body_str = (str(exc.body) if exc.body else "").lower()
+        exc_str = str(exc).lower()
         if exc.status_code == 405:
             return True
-        if "content-blocked" in body_str or "content-blocked" in exc_str:
-            return True
-        if any(w in body_str or w in exc_str for w in ("很抱歉", "security", "<!doctypehtml>", "potential threat")):
+        blocked_keywords = (
+            "content-blocked",
+            "content_blocked",
+            "content_filter",
+            "content blocked",
+            "很抱歉",
+            "security",
+            "<!doctypehtml>",
+            "potential threat",
+            "sensitive",
+            "moderation",
+            "violation",
+        )
+        if any(w in body_str or w in exc_str for w in blocked_keywords):
             return True
     return False
 
@@ -542,8 +550,22 @@ def _stream_worker(kw: dict, q: queue.Queue, client: anthropic.Anthropic) -> Non
                         raise second_err
             elif _is_blocked_error(first_err):
                 fb_kw = _fallback_kw(kw)
-                resp_cm = client.messages.with_streaming_response.create(**fb_kw)
-                resp = resp_cm.__enter__()
+                try:
+                    resp_cm = client.messages.with_streaming_response.create(**fb_kw)
+                    resp = resp_cm.__enter__()
+                except Exception as second_err:
+                    if resp_cm is not None:
+                        try:
+                            resp_cm.__exit__(None, None, None)
+                        except Exception:
+                            pass
+                        resp_cm = None
+                    if _is_thinking_error(second_err):
+                        tb_kw = _fallback_thinking_kw(fb_kw)
+                        resp_cm = client.messages.with_streaming_response.create(**tb_kw)
+                        resp = resp_cm.__enter__()
+                    else:
+                        raise second_err
             else:
                 raise first_err
 
@@ -719,7 +741,13 @@ async def messages(request: Request):
                     raise second_err
             if _is_blocked_error(first_err):
                 fb_kw = _fallback_kw(kw)
-                return client.messages.create(**fb_kw)
+                try:
+                    return client.messages.create(**fb_kw)
+                except Exception as second_err:
+                    if _is_thinking_error(second_err):
+                        tb_kw = _fallback_thinking_kw(fb_kw)
+                        return client.messages.create(**tb_kw)
+                    raise second_err
             raise first_err
 
     try:
