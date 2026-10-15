@@ -770,14 +770,11 @@ async def models():
     return {
         "object": "list",
         "data": [
-            {"id": "claude-opus-4-8", "object": "model"},
-            {"id": "gpt-5.6-sol", "object": "model"},
-            {"id": "kimi-k3", "object": "model"},
-            {"id": "claude-fable-5", "object": "model"},
-            {"id": "claude-opus-5", "object": "model"},
             {"id": "deepseek-v4-flash", "object": "model"},
             {"id": "glm-5.3", "object": "model"},
             {"id": "gpt-6-astra", "object": "model"},
+            {"id": "claude-opus-5-5", "object": "model"},
+            {"id": "gpt-6.1-sol", "object": "model"},
         ],
     }
 
