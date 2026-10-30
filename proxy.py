@@ -812,7 +812,7 @@ def _build_responses_payload(body: dict) -> dict:
         if isinstance(oc, dict) and "effort" in oc:
             re_effort = oc["effort"]
     if re_effort:
-        payload["reasoning"] = {"effort": re_effort}
+        payload["reasoning"] = {"effort": re_effort, "summary": "auto"}
 
     return payload
 
@@ -825,7 +825,17 @@ def _responses_to_anthropic_non_stream(resp_data: dict, model: str) -> dict:
 
     for item in resp_data.get("output", []):
         itype = item.get("type")
-        if itype == "message":
+        if itype == "reasoning":
+            summary_parts = item.get("summary", [])
+            summary_texts = []
+            for sp in summary_parts:
+                if isinstance(sp, dict) and "text" in sp:
+                    summary_texts.append(sp["text"])
+                elif isinstance(sp, str):
+                    summary_texts.append(sp)
+            if summary_texts:
+                content_blocks.append({"type": "thinking", "thinking": "".join(summary_texts)})
+        elif itype == "message":
             for part in item.get("content", []):
                 if part.get("type") == "output_text":
                     text = _clean_model_output(part.get("text", ""))
@@ -957,6 +967,31 @@ def _stream_responses_worker(payload: dict, q: queue.Queue, client: anthropic.An
                         }
                     }
                     q.put(f"event: message_start\ndata: {json.dumps(init_event)}\n\n".encode())
+
+                elif event_name in ("response.reasoning_summary_text.delta", "response.reasoning.delta"):
+                    delta_text = data.get("delta", "")
+                    if delta_text:
+                        if not block_open:
+                            block_open = True
+                            start_event = {
+                                "type": "content_block_start",
+                                "index": cur_index,
+                                "content_block": {"type": "thinking", "thinking": ""}
+                            }
+                            q.put(f"event: content_block_start\ndata: {json.dumps(start_event)}\n\n".encode())
+                        delta_event = {
+                            "type": "content_block_delta",
+                            "index": cur_index,
+                            "delta": {"type": "thinking_delta", "thinking": delta_text}
+                        }
+                        q.put(f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n".encode())
+
+                elif event_name in ("response.reasoning_summary_text.done", "response.reasoning.done"):
+                    if block_open:
+                        stop_event = {"type": "content_block_stop", "index": cur_index}
+                        q.put(f"event: content_block_stop\ndata: {json.dumps(stop_event)}\n\n".encode())
+                        block_open = False
+                        cur_index += 1
 
                 elif event_name == "response.content_part.added":
                     part = data.get("part", {})
