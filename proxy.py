@@ -138,7 +138,9 @@ _WAF_RULES = [
 
     # 3. Execution functions & SQLi/dangerous functions:
     # system(, exec(, eval(, passthru(, assert(, phpinfo(, sleep(, load_file(, updatexml(, extractvalue(, benchmark(, shell_exec(, popen(, proc_open(
-    (re.compile(r"\b(system|exec|eval|passthru|assert|phpinfo|sleep|load_file|updatexml|extractvalue|benchmark|shell_exec|popen|proc_open)\s*\(", re.IGNORECASE), rf"\g<1>{_ZWSP}("),
+    (re.compile(
+        r"\b(system|exec|eval|passthru|assert|phpinfo|sleep|load_file|updatexml|extractvalue|benchmark|shell_exec|popen|proc_open)\s*\(",
+        re.IGNORECASE), rf"\g<1>{_ZWSP}("),
 
     # 4. Dangerous protocols & JNDI: ldap://, rmi://, file:///, ${jndi:...}
     (re.compile(r"\b(ldap|rmi):(//)", re.IGNORECASE), rf"\g<1>:{_ZWSP}\g<2>"),
@@ -169,7 +171,9 @@ _WAF_RULES = [
     (re.compile(r"(<!EN)(TITY)\b", re.IGNORECASE), rf"\g<1>{_ZWSP}\g<2>"),
 
     # 9. Shell command injection chaining (; echo, ; cat, | bash, && rm, | grep, etc.)
-    (re.compile(r"([;|&`]\s*)\b(echo|cat|curl|wget|bash|sh|zsh|python|perl|ruby|rm|ls|id|whoami|chmod|chown|kill|nc|netcat|uname|grep|ps|sudo|php)\b", re.IGNORECASE), rf"\g<1>{_ZWSP}\g<2>"),
+    (re.compile(
+        r"([;|&`]\s*)\b(echo|cat|curl|wget|bash|sh|zsh|python|perl|ruby|rm|ls|id|whoami|chmod|chown|kill|nc|netcat|uname|grep|ps|sudo|php)\b",
+        re.IGNORECASE), rf"\g<1>{_ZWSP}\g<2>"),
 ]
 
 
@@ -363,10 +367,10 @@ def _is_thinking_error(exc: Exception) -> bool:
         exc_str = str(exc)
         combined = (body_str + " " + exc_str).lower()
         if "thinking" in combined and (
-            "must be passed back" in combined
-            or "content[].thinking" in combined
-            or "missing field `thinking`" in combined
-            or "missing field 'thinking'" in combined
+                "must be passed back" in combined
+                or "content[].thinking" in combined
+                or "missing field `thinking`" in combined
+                or "missing field 'thinking'" in combined
         ):
             return True
     return False
@@ -661,6 +665,411 @@ async def _stream_gen(kw: dict, client: anthropic.Anthropic):
         yield chunk
 
 
+# ── OpenAI Responses API (/v1/responses) Translation ─────────────────────────
+
+MODELS_LIST: list[dict[str, Any]] = [
+    {"id": "deepseek-v4-flash", "object": "model", "upstream": "anthropic"},
+    {"id": "glm-5.3", "object": "model", "upstream": "anthropic"},
+    {"id": "gpt-6-astra", "object": "model", "upstream": "openai"},
+    {"id": "claude-opus-5-5", "object": "model", "upstream": "anthropic"},
+    {"id": "gpt-6.1-sol", "object": "model", "upstream": "openai"},
+    {"id": "gpt-5.6-sol", "object": "model", "upstream": "anthropic"},
+]
+
+
+def _get_model_upstream(model_name: str) -> str:
+    """Return configured upstream protocol ('openai', 'anthropic', or '')."""
+    for m in MODELS_LIST:
+        if m.get("id") == model_name:
+            return str(m.get("upstream", "")).strip().lower()
+    return ""
+
+
+def _build_responses_payload(body: dict) -> dict:
+    """Translate Anthropic Messages API payload into OpenAI Responses API (/v1/responses) payload."""
+    model = body.get("model")
+    raw_system = body.get("system")
+    instructions = ""
+    if isinstance(raw_system, str):
+        instructions = _sanitize_waf_str(raw_system)
+    elif isinstance(raw_system, list):
+        parts = []
+        for b in raw_system:
+            if isinstance(b, dict) and "text" in b:
+                parts.append(_sanitize_waf_str(str(b["text"])))
+            elif isinstance(b, str):
+                parts.append(_sanitize_waf_str(b))
+        instructions = "\n\n".join(parts)
+
+    input_items = []
+    raw_messages = body.get("messages", [])
+    for msg in raw_messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role", "user")
+        content = msg.get("content")
+
+        if isinstance(content, str):
+            ptype = "input_text" if role == "user" else "output_text"
+            input_items.append({"role": role, "content": [{"type": ptype, "text": _sanitize_waf_str(content)}]})
+            continue
+
+        if isinstance(content, list):
+            item_parts = []
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "text":
+                    ptype = "input_text" if role == "user" else "output_text"
+                    item_parts.append({"type": ptype, "text": _sanitize_waf_str(block.get("text", ""))})
+                elif btype == "image":
+                    src = block.get("source", {})
+                    if isinstance(src, dict):
+                        stype = src.get("type")
+                        if stype == "base64":
+                            data = src.get("data", "")
+                            mtype = src.get("media_type", "image/png")
+                            item_parts.append({
+                                "type": "input_image",
+                                "image_url": f"data:{mtype};base64,{data}"
+                            })
+                        elif stype == "url":
+                            item_parts.append({
+                                "type": "input_image",
+                                "image_url": src.get("url", "")
+                            })
+                elif btype == "image_url":
+                    img_url = block.get("image_url", {})
+                    url = img_url.get("url", "") if isinstance(img_url, dict) else str(img_url)
+                    item_parts.append({"type": "input_image", "image_url": url})
+                elif btype == "tool_use":
+                    call_id = block.get("id", "")
+                    name = block.get("name", "")
+                    args = block.get("input", {})
+                    input_items.append({
+                        "type": "function_call",
+                        "call_id": call_id,
+                        "name": name,
+                        "arguments": json.dumps(args) if isinstance(args, (dict, list)) else str(args)
+                    })
+                elif btype == "tool_result":
+                    tool_use_id = block.get("tool_use_id", "")
+                    t_content = block.get("content", "")
+                    if isinstance(t_content, list):
+                        text_list = []
+                        for tc in t_content:
+                            if isinstance(tc, dict) and "text" in tc:
+                                text_list.append(tc["text"])
+                            elif isinstance(tc, str):
+                                text_list.append(tc)
+                        t_content = "\n".join(text_list)
+                    elif not isinstance(t_content, str):
+                        t_content = json.dumps(t_content)
+                    input_items.append({
+                        "type": "function_call_output",
+                        "call_id": tool_use_id,
+                        "output": _sanitize_waf_str(t_content)
+                    })
+
+            if item_parts:
+                input_items.append({"role": role, "content": item_parts})
+
+    max_tokens = body.get("max_tokens")
+    if not max_tokens:
+        max_tokens = 64000
+    elif max_tokens < 1000:
+        max_tokens = max(max_tokens, 4096)
+
+    payload = {
+        "model": model,
+        "input": input_items,
+        "max_output_tokens": max_tokens,
+    }
+    if instructions:
+        payload["instructions"] = instructions
+
+    responses_tools = []
+    for tool in body.get("tools", []):
+        if isinstance(tool, dict) and "name" in tool:
+            responses_tools.append({
+                "type": "function",
+                "name": tool["name"],
+                "description": tool.get("description", ""),
+                "parameters": tool.get("input_schema", {"type": "object", "properties": {}})
+            })
+    if responses_tools:
+        payload["tools"] = responses_tools
+
+    if "temperature" in body:
+        payload["temperature"] = body["temperature"]
+    if "top_p" in body:
+        payload["top_p"] = body["top_p"]
+
+    re_effort = body.get("reasoning_effort")
+    if not re_effort:
+        oc = body.get("output_config")
+        if isinstance(oc, dict) and "effort" in oc:
+            re_effort = oc["effort"]
+    if re_effort:
+        payload["reasoning"] = {"effort": re_effort}
+
+    return payload
+
+
+def _responses_to_anthropic_non_stream(resp_data: dict, model: str) -> dict:
+    """Convert OpenAI Responses API completion payload to Anthropic Message schema."""
+    resp_id = resp_data.get("id", "msg_responses")
+    content_blocks = []
+    stop_reason = "end_turn"
+
+    for item in resp_data.get("output", []):
+        itype = item.get("type")
+        if itype == "message":
+            for part in item.get("content", []):
+                if part.get("type") == "output_text":
+                    text = _clean_model_output(part.get("text", ""))
+                    content_blocks.append({"type": "text", "text": text})
+        elif itype == "function_call":
+            call_id = item.get("call_id") or item.get("id", "")
+            name = item.get("name", "")
+            args_str = item.get("arguments", "{}")
+            try:
+                args = json.loads(args_str)
+            except Exception:
+                args = {"raw": args_str}
+            content_blocks.append({
+                "type": "tool_use",
+                "id": call_id,
+                "name": name,
+                "input": args
+            })
+            stop_reason = "tool_use"
+
+    if resp_data.get("status") == "incomplete":
+        inc_reason = resp_data.get("incomplete_details", {}).get("reason")
+        if inc_reason == "max_output_tokens":
+            stop_reason = "max_tokens"
+
+    if not content_blocks:
+        content_blocks.append({"type": "text", "text": ""})
+
+    usage = resp_data.get("usage", {})
+    return {
+        "id": resp_id,
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": content_blocks,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": usage.get("input_tokens", 0),
+            "output_tokens": usage.get("output_tokens", 0)
+        }
+    }
+
+
+def _run_responses_non_stream(client: anthropic.Anthropic, payload: dict) -> dict:
+    """Execute a non-streaming request against /v1/responses with WAF fallback."""
+    try:
+        res = client.post("/v1/responses", body=payload, cast_to=object)
+    except Exception as first_err:
+        if _is_blocked_error(first_err):
+            fb_payload = copy.deepcopy(payload)
+            if "instructions" in fb_payload:
+                fb_payload["instructions"] = _fullwidth_neutralize(fb_payload["instructions"])
+            if "input" in fb_payload:
+                fb_payload["input"] = _fullwidth_neutralize(fb_payload["input"])
+            res = client.post("/v1/responses", body=fb_payload, cast_to=object)
+        else:
+            raise first_err
+
+    return _responses_to_anthropic_non_stream(res, payload.get("model", ""))
+
+
+def _stream_responses_worker(payload: dict, q: queue.Queue, client: anthropic.Anthropic) -> None:
+    """Worker thread translating /v1/responses SSE stream to Anthropic Messages SSE stream."""
+    stream_payload = dict(payload)
+    stream_payload["stream"] = True
+    model = payload.get("model", "")
+
+    stream_obj = None
+    try:
+        try:
+            stream_obj = client.post("/v1/responses", body=stream_payload, stream=True, cast_to=object)
+        except Exception as first_err:
+            if stream_obj is not None:
+                try:
+                    stream_obj.close()
+                except Exception:
+                    pass
+                stream_obj = None
+            if _is_blocked_error(first_err):
+                fb_payload = copy.deepcopy(stream_payload)
+                if "instructions" in fb_payload:
+                    fb_payload["instructions"] = _fullwidth_neutralize(fb_payload["instructions"])
+                if "input" in fb_payload:
+                    fb_payload["input"] = _fullwidth_neutralize(fb_payload["input"])
+                stream_obj = client.post("/v1/responses", body=fb_payload, stream=True, cast_to=object)
+            else:
+                raise first_err
+
+        with stream_obj:
+            raw_resp = stream_obj.response
+            event_name = ""
+            cur_index = 0
+            block_open = False
+            seen_stop = False
+            stop_reason = "end_turn"
+            output_tokens = 0
+
+            for raw_line in raw_resp.iter_lines():
+                if not raw_line:
+                    continue
+                line = raw_line.strip()
+                if line.startswith("event:"):
+                    event_name = line[6:].strip()
+                    continue
+                if not line.startswith("data:"):
+                    continue
+
+                raw_data = line[5:].strip()
+                try:
+                    data = json.loads(raw_data)
+                except Exception:
+                    continue
+
+                if event_name == "response.created":
+                    resp_info = data.get("response", {})
+                    resp_id = resp_info.get("id", "msg_responses")
+                    init_event = {
+                        "type": "message_start",
+                        "message": {
+                            "id": resp_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [],
+                            "model": model,
+                            "stop_reason": None,
+                            "stop_sequence": None,
+                            "usage": {"input_tokens": 0, "output_tokens": 0}
+                        }
+                    }
+                    q.put(f"event: message_start\ndata: {json.dumps(init_event)}\n\n".encode())
+
+                elif event_name == "response.content_part.added":
+                    part = data.get("part", {})
+                    if part.get("type") == "output_text":
+                        block_open = True
+                        start_event = {
+                            "type": "content_block_start",
+                            "index": cur_index,
+                            "content_block": {"type": "text", "text": ""}
+                        }
+                        q.put(f"event: content_block_start\ndata: {json.dumps(start_event)}\n\n".encode())
+
+                elif event_name == "response.output_text.delta":
+                    delta_text = data.get("delta", "")
+                    cleaned_delta = _clean_model_output(delta_text)
+                    delta_event = {
+                        "type": "content_block_delta",
+                        "index": cur_index,
+                        "delta": {"type": "text_delta", "text": cleaned_delta}
+                    }
+                    q.put(f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n".encode())
+
+                elif event_name in ("response.output_text.done", "response.content_part.done"):
+                    if block_open:
+                        stop_event = {"type": "content_block_stop", "index": cur_index}
+                        q.put(f"event: content_block_stop\ndata: {json.dumps(stop_event)}\n\n".encode())
+                        block_open = False
+                        cur_index += 1
+
+                elif event_name == "response.output_item.added":
+                    item = data.get("item", {})
+                    if item.get("type") == "function_call":
+                        if block_open:
+                            stop_event = {"type": "content_block_stop", "index": cur_index}
+                            q.put(f"event: content_block_stop\ndata: {json.dumps(stop_event)}\n\n".encode())
+                            block_open = False
+                            cur_index += 1
+                        block_open = True
+                        call_id = item.get("call_id") or item.get("id", "")
+                        name = item.get("name", "")
+                        start_event = {
+                            "type": "content_block_start",
+                            "index": cur_index,
+                            "content_block": {"type": "tool_use", "id": call_id, "name": name, "input": {}}
+                        }
+                        q.put(f"event: content_block_start\ndata: {json.dumps(start_event)}\n\n".encode())
+
+                elif event_name == "response.function_call_arguments.delta":
+                    delta_args = data.get("delta", "")
+                    delta_event = {
+                        "type": "content_block_delta",
+                        "index": cur_index,
+                        "delta": {"type": "input_json_delta", "partial_json": delta_args}
+                    }
+                    q.put(f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n".encode())
+
+                elif event_name in ("response.function_call_arguments.done", "response.output_item.done"):
+                    item = data.get("item", {})
+                    if item.get("type") == "function_call" or event_name == "response.function_call_arguments.done":
+                        if block_open:
+                            stop_event = {"type": "content_block_stop", "index": cur_index}
+                            q.put(f"event: content_block_stop\ndata: {json.dumps(stop_event)}\n\n".encode())
+                            block_open = False
+                            cur_index += 1
+                        stop_reason = "tool_use"
+
+                elif event_name == "response.completed":
+                    seen_stop = True
+                    resp_obj = data.get("response", {})
+                    usage = resp_obj.get("usage", {})
+                    output_tokens = usage.get("output_tokens", 0)
+
+            if block_open:
+                stop_blk = {"type": "content_block_stop", "index": cur_index}
+                q.put(f"event: content_block_stop\ndata: {json.dumps(stop_blk)}\n\n".encode())
+
+            delta_event = {
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                "usage": {"output_tokens": output_tokens}
+            }
+            q.put(f"event: message_delta\ndata: {json.dumps(delta_event)}\n\n".encode())
+            q.put(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+
+    except Exception as exc:
+        q.put(exc)
+    finally:
+        q.put(None)
+
+
+async def _stream_responses_gen(payload: dict, client: anthropic.Anthropic):
+    """Async generator wrapping _stream_responses_worker via a queue."""
+    q: queue.Queue = queue.Queue()
+    t = threading.Thread(target=_stream_responses_worker, args=(payload, q, client), daemon=True)
+    t.start()
+    loop = asyncio.get_running_loop()
+    while True:
+        try:
+            chunk = await asyncio.wait_for(
+                loop.run_in_executor(None, q.get),
+                timeout=CHUNK_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            raise TimeoutError(
+                f"No chunk received from agentrouter.org in {CHUNK_TIMEOUT}s — upstream stalled"
+            )
+        if chunk is None:
+            break
+        if isinstance(chunk, Exception):
+            raise chunk
+        yield chunk
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 app = FastAPI()
@@ -705,8 +1114,42 @@ def _format_api_error(e: Exception) -> tuple[int, dict]:
 @app.post("/messages")
 async def messages(request: Request):
     body = await request.json()
-    kw = _kwargs(body)
+    model = body.get("model", "")
     client = _client_for(_extract_api_key(request))
+
+    if _get_model_upstream(model) == "openai":
+        payload = _build_responses_payload(body)
+        if body.get("stream", False):
+            async def _safe_stream():
+                try:
+                    async for chunk in _stream_responses_gen(payload, client):
+                        yield chunk
+                except Exception as e:
+                    _, err_body = _format_api_error(e)
+                    yield f"event: error\ndata: {json.dumps(err_body)}\n\n".encode()
+
+            return StreamingResponse(
+                _safe_stream(),
+                media_type="text/event-stream",
+                headers={"cache-control": "no-cache", "x-accel-buffering": "no"},
+            )
+
+        def _run_resp():
+            return _run_responses_non_stream(client, payload)
+
+        try:
+            msg_dict = await asyncio.to_thread(_run_resp)
+            cleaned_json = _clean_model_output(json.dumps(msg_dict))
+            return Response(content=cleaned_json, media_type="application/json")
+        except Exception as e:
+            status, err_body = _format_api_error(e)
+            return Response(
+                content=json.dumps(err_body),
+                status_code=status,
+                media_type="application/json",
+            )
+
+    kw = _kwargs(body)
 
     if body.get("stream", False):
         kw["stream"] = True
@@ -769,13 +1212,7 @@ async def models():
     """Stub model list — only lists models confirmed working on agentrouter.org."""
     return {
         "object": "list",
-        "data": [
-            {"id": "deepseek-v4-flash", "object": "model"},
-            {"id": "glm-5.3", "object": "model"},
-            {"id": "gpt-6-astra", "object": "model"},
-            {"id": "claude-opus-5-5", "object": "model"},
-            {"id": "gpt-6.1-sol", "object": "model"},
-        ],
+        "data": MODELS_LIST,
     }
 
 
