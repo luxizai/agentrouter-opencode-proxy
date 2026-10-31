@@ -710,7 +710,7 @@ def _build_responses_payload(body: dict) -> dict:
         content = msg.get("content")
 
         if isinstance(content, str):
-            ptype = "input_text" if role == "user" else "output_text"
+            ptype = "output_text" if role == "assistant" else "input_text"
             input_items.append({"role": role, "content": [{"type": ptype, "text": _sanitize_waf_str(content)}]})
             continue
 
@@ -721,7 +721,7 @@ def _build_responses_payload(body: dict) -> dict:
                     continue
                 btype = block.get("type")
                 if btype == "text":
-                    ptype = "input_text" if role == "user" else "output_text"
+                    ptype = "output_text" if role == "assistant" else "input_text"
                     item_parts.append({"type": ptype, "text": _sanitize_waf_str(block.get("text", ""))})
                 elif btype == "image":
                     src = block.get("source", {})
